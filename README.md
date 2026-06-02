@@ -65,3 +65,7 @@ immediately bwd); recomputation's real memory payoff is across **many layers**
 deep forward), which a one-block micro-benchmark does not capture. To actually
 beat autograd on memory for one block you'd need a fused backward (e.g. a Triton
 kernel writing `grad_preact` in place with no intermediate buffers).
+
+For *why* forward-saved activations (not the backward) set the training-memory
+peak — and why this single-block benchmark is misleading — see
+[`training_memory_forward_vs_backward.md`](./training_memory_forward_vs_backward.md).
