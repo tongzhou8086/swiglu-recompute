@@ -16,9 +16,11 @@ it explains why the single-block benchmark in this repo was misleading.
 - Recomputing the SwiGLU activation instead of saving it cuts the per-layer
   saved footprint by **~610 MiB** (two `[M,H]` tensors — `h` *and* `silu(gate)`;
   see below) → a win that grows with depth, invisible at a single block.
-- With the elementwise helpers `@torch.compile`d, recompute is also ~8% *faster*
-  than standard autograd at every depth — so at depth it is a Pareto win (less
-  memory *and* faster).
+- **Caveat on speed:** comparing compiled-recompute to an *eager* baseline shows
+  recompute ~8% faster, but that is mostly *compiled-vs-eager*. Against a
+  `torch.compile`d baseline (the fair comparison) recompute is ~1–4% *slower*, and
+  `torch.compile` alone already auto-recomputes ~half the savings. See "Fair
+  comparison" below.
 
 ## Two kinds of memory, with very different lifetimes
 
@@ -136,11 +138,10 @@ M=11136 D=3584 H=14336):
   dominated by the backward transient, not saved activations. It crosses over at
   `N = 2` and the win grows ~linearly with depth — **41% less peak at 16 blocks**,
   and the fraction keeps rising (toward the asymptote derived below).
-- **Speed:** recompute is **~7–9% faster at every depth** (`rc/gt ≈ 1.08x`). The
-  `@torch.compile`d elementwise helpers fuse each pointwise chain into one kernel
-  (fewer launches, less HBM traffic), which outweighs the extra recompute work —
-  a per-block edge that holds as you stack. So at depth, recompute is a **Pareto
-  win: faster *and* lower peak memory.**
+- **Speed (with a caveat):** here recompute looks ~7–9% faster (`rc/gt ≈ 1.08x`),
+  but the baseline is **eager** and recompute uses `@torch.compile`d helpers — so
+  this is *not* apples-to-apples. The fair comparison is below; the short version
+  is that the speed edge is "compiled vs eager," not "recompute vs save."
 
 This is the staircase argument made concrete: the memory win is invisible at one
 block and emerges only once the persistent saved-activation pool (which scales
@@ -219,6 +220,44 @@ matching the trend (−14% → +10% → +26% → +36% → +41% → ~47%). Two co
   only `x`, recompute `preact` too — full activation checkpointing), trading the
   `W1` matmul recompute for a smaller slope.
 
+## Fair comparison: compile the baseline too
+
+The stacked table compares compiled-recompute against an **eager** baseline, so
+part of the apparent speedup is just "compiled vs eager." The honest baseline is
+a `torch.compile`d standard module — and importantly, when you compile a standard
+module, **AOTAutograd + Inductor generate the backward and the min-cut
+partitioner automatically recomputes cheap activations**. So the baseline already
+does some of what we did by hand. Three-way (`bench_fair_compile.py`, H800, bf16):
+
+```
+ N |  gt-eager        gt-compiled       recompute        recompute vs gt-compiled
+ 1 | 2002M / 16.9ms   1699M / 15.3ms    2275M / 15.7ms    +34% mem, 0.97x speed
+ 4 | 5887M / 70.4ms   4670M / 62.7ms    4334M / 65.3ms     -7% mem, 0.96x speed
+ 8 |11068M /124.3ms   8633M /113.7ms    7078M /115.2ms    -18% mem, 0.99x speed
+```
+
+Per-block slopes tell the story:
+
+```
+gt-eager     ~1295 MiB/block   saves x, preact, silu(gate), h
+gt-compiled  ~991  MiB/block   Inductor auto-recomputes ~one [M,H]
+recompute    ~686  MiB/block   we recompute both silu(gate) and h
+```
+
+- **Speed: recompute is *not* faster.** Against the compiled baseline it is ~1–4%
+  *slower* — it does the extra recompute work. The earlier "+8%" was entirely
+  compiled-vs-eager.
+- **`torch.compile` alone is a big free win.** Just compiling the standard module
+  drops memory ~22% vs eager (N=8) with zero code change, because Inductor
+  recomputes ~one `[M,H]`/block on its own.
+- **Manual recompute still adds memory savings at depth.** It recomputes *both*
+  `[M,H]` tensors (slope 686 vs 991), so it beats even the compiled baseline by
+  −18% at N=8 and growing (asymptote ~1 − 686/991 ≈ 31%, vs ~47% against eager).
+
+So the manual `autograd.Function` is a **memory-at-depth** tool, not a speedup:
+its only edge over `torch.compile`d standard autograd is recomputing the second
+`[M,H]` that Inductor's partitioner chooses to keep — at a small speed cost.
+
 ## One precision
 
 "The backward doesn't matter *at all*" is ~99% true but not literal: the peak does
@@ -235,3 +274,7 @@ include one layer's backward temporaries (the `+ 1 ×` term). It simply does not
 - To *measure* a recomputation memory win, stack `N` blocks (a realistic forward
   followed by one backward) so the saved-activation staircase appears; a single
   block hides it.
+- Always benchmark against a **`torch.compile`d** baseline, not eager. Inductor
+  fuses *and* auto-recomputes activations (min-cut partitioner), so "compiled vs
+  eager" can masquerade as an algorithmic win. Often `torch.compile` on the
+  standard module captures most of the benefit with no custom code.

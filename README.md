@@ -88,14 +88,36 @@ but grows ~linearly with depth:
 python bench_stacked_blocks.py            # default N = 1,2,4,8,16
 ```
 
-- **Memory:** recompute loses at one block but the win grows with depth (41% less
-  at N=16, heading toward a ~47% asymptote). Per-block growth is ~1295 MiB
-  (ground-truth) vs ~686 MiB (recompute): recompute avoids ~610 MiB/block ≈ *two*
-  `[M,H]` tensors (standard autograd saves both `silu(gate)` and `h`; recompute
-  reconstructs both from `preact`).
-- **Speed:** with the `@torch.compile`d helpers, recompute is ~7–9% *faster* at
-  every depth — so at depth it is a Pareto win (faster *and* lower memory).
+- **Memory (vs *eager* autograd):** recompute loses at one block but the win
+  grows with depth (41% less at N=16). Per-block: ~1295 MiB (eager) vs ~686 MiB
+  (recompute) — recompute avoids ~610 MiB/block ≈ *two* `[M,H]` tensors (eager
+  saves both `silu(gate)` and `h`; recompute rebuilds both from `preact`).
+
+> [!IMPORTANT]
+> The table above compares against an **eager** baseline. That is *not*
+> apples-to-apples on speed, because recompute uses `@torch.compile`d helpers.
+> See the fair comparison below.
+
+## Fair comparison: compile the baseline too (`bench_fair_compile.py`)
+
+When you `torch.compile` a *standard* module, AOTAutograd + Inductor generate the
+backward and the min-cut partitioner **automatically recomputes** cheap
+activations. Against that fair baseline (H800, bf16):
+
+| N | gt-eager | **gt-compiled** | recompute | recompute vs gt-compiled |
+|---|---|---|---|---|
+| 1 | 2002 MiB / 16.9 ms | 1699 / 15.3 | 2275 / 15.7 | +34% mem, 0.97× speed |
+| 4 | 5887 / 70.4 | 4670 / 62.7 | 4334 / 65.3 | −7% mem, 0.96× speed |
+| 8 | 11068 / 124.3 | 8633 / 113.7 | 7078 / 115.2 | **−18% mem**, 0.99× speed |
+
+- **Speed: recompute is *not* faster** — it is ~1–4% *slower* than the compiled
+  baseline. The earlier "~8% faster" was purely *compiled-vs-eager*.
+- **`torch.compile` alone** already cuts memory a lot (N=8: −22% vs eager) for
+  free — Inductor auto-recomputes ~one `[M,H]`/block (slope ~991 vs eager 1295).
+- **Manual recompute** still saves *more* at depth (−18% at N=8, growing): it
+  recomputes *both* `[M,H]` tensors (slope ~686) where Inductor keeps one. Its
+  value is extra memory at depth, at a small speed cost — not a free speedup.
 
 See [`training_memory_forward_vs_backward.md`](./training_memory_forward_vs_backward.md)
 for the full breakdown (what autograd saves, the affine slope/intercept model,
-and why the reduction % grows then saturates).
+the reduction-% asymptote, and this fair-comparison analysis).
