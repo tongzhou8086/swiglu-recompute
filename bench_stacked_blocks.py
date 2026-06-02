@@ -77,6 +77,31 @@ def measure_peak(model, x0, gout, reps=3):
     return mib(best)
 
 
+def time_full(model, x0, gout, iters=8, warmup=4, reps=3):
+    """Full fwd+bwd time per step (ms), min over reps."""
+    params = list(model.parameters())
+
+    def step():
+        x = x0.detach().requires_grad_(True)
+        y = model(x)
+        torch.autograd.grad(y, [x] + params, gout)
+
+    for _ in range(warmup):
+        step()
+    torch.cuda.synchronize()
+    vals = []
+    for _ in range(reps):
+        s = torch.cuda.Event(True)
+        e = torch.cuda.Event(True)
+        s.record()
+        for _ in range(iters):
+            step()
+        e.record()
+        torch.cuda.synchronize()
+        vals.append(s.elapsed_time(e) / iters)
+    return min(vals)
+
+
 def measure_for_N(N, M, D, H, dtype):
     x0 = torch.randn(M, D, device="cuda", dtype=dtype)
     gout = torch.randn(M, D, device="cuda", dtype=dtype)  # stack output is [M, D]
@@ -84,14 +109,16 @@ def measure_for_N(N, M, D, H, dtype):
     # Build + measure one stack at a time so the two don't coexist in memory.
     gt = Stack(SwiGLUMLPGroundTruth, N, D, H, dtype).cuda()
     gt_mem = measure_peak(gt, x0, gout)
+    gt_t = time_full(gt, x0, gout)
     del gt
     sync_clean()
 
     rc = Stack(SwiGLUMLPCustom, N, D, H, dtype).cuda()
     rc_mem = measure_peak(rc, x0, gout)
+    rc_t = time_full(rc, x0, gout)
     del rc, x0, gout
     sync_clean()
-    return gt_mem, rc_mem
+    return gt_mem, rc_mem, gt_t, rc_t
 
 
 def main():
@@ -110,13 +137,15 @@ def main():
     print(f"M={args.m} D={args.d} H={args.h} dtype={dtype}")
     print(f"per-block `h` [M,H] = {h_mib:.1f} MiB  (the persistent activation recompute avoids)\n")
 
-    print(f"{'N':>3} | {'ground_truth':>14} | {'recompute':>12} | {'saving':>12} | {'saving/N':>9}")
-    print("-" * 64)
+    hdr = (f"{'N':>3} | {'gt mem':>10} {'rc mem':>10} {'saving':>10} {'%':>6} | "
+           f"{'gt ms':>8} {'rc ms':>8} {'rc/gt':>6}")
+    print(hdr)
+    print("-" * len(hdr))
     for N in args.ns:
-        gt_mem, rc_mem = measure_for_N(N, args.m, args.d, args.h, dtype)
+        gt_mem, rc_mem, gt_t, rc_t = measure_for_N(N, args.m, args.d, args.h, dtype)
         saving = gt_mem - rc_mem
-        print(f"{N:>3} | {gt_mem:>11.1f} MiB | {rc_mem:>8.1f} MiB | "
-              f"{saving:>8.1f} MiB | {saving / N:>6.1f} MiB")
+        print(f"{N:>3} | {gt_mem:>9.0f}M {rc_mem:>9.0f}M {saving:>9.0f}M "
+              f"{100 * saving / gt_mem:>5.0f}% | {gt_t:>7.1f} {rc_t:>7.1f} {gt_t / rc_t:>5.2f}x")
 
 
 if __name__ == "__main__":

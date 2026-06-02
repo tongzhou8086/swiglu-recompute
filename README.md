@@ -76,18 +76,26 @@ peak — and why this single-block benchmark is misleading — see
 backward) and measures peak memory. The recompute win is invisible at one block
 but grows ~linearly with depth:
 
-| N | ground_truth | recompute | saving |
-|---|---|---|---|
-| 1 | 2002 MiB | 2275 MiB | −273 MiB (worse) |
-| 2 | 3297 MiB | 2961 MiB | +336 MiB |
-| 4 | 5887 MiB | 4334 MiB | +1554 MiB |
-| 8 | 11068 MiB | 7078 MiB | +3990 MiB (−36%) |
-| 16 | 21429 MiB | 12567 MiB | +8862 MiB (−41%) |
+| N | gt mem | rc mem | mem saving | gt ms | rc ms | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 2002 MiB | 2275 MiB | −14% (worse) | 16.8 | 15.6 | 1.08× |
+| 2 | 3297 MiB | 2961 MiB | +10% | 33.8 | 31.2 | 1.08× |
+| 4 | 5888 MiB | 4334 MiB | +26% | 69.4 | 64.6 | 1.07× |
+| 8 | 11068 MiB | 7078 MiB | +36% | 124.4 | 115.3 | 1.08× |
+| 16 | 21429 MiB | 12567 MiB | **+41%** | 243.0 | 223.7 | 1.09× |
 
 ```bash
 python bench_stacked_blocks.py            # default N = 1,2,4,8,16
 ```
 
-Per-block growth is ~1295 MiB (ground-truth) vs ~686 MiB (recompute): recompute
-avoids ~610 MiB/block ≈ *two* `[M,H]` tensors per layer (standard autograd saves
-both `silu(gate)` and `h`; recompute reconstructs both from `preact`).
+- **Memory:** recompute loses at one block but the win grows with depth (41% less
+  at N=16, heading toward a ~47% asymptote). Per-block growth is ~1295 MiB
+  (ground-truth) vs ~686 MiB (recompute): recompute avoids ~610 MiB/block ≈ *two*
+  `[M,H]` tensors (standard autograd saves both `silu(gate)` and `h`; recompute
+  reconstructs both from `preact`).
+- **Speed:** with the `@torch.compile`d helpers, recompute is ~7–9% *faster* at
+  every depth — so at depth it is a Pareto win (faster *and* lower memory).
+
+See [`training_memory_forward_vs_backward.md`](./training_memory_forward_vs_backward.md)
+for the full breakdown (what autograd saves, the affine slope/intercept model,
+and why the reduction % grows then saturates).
