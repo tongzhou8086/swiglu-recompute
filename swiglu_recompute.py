@@ -23,12 +23,14 @@ import torch.nn.functional as F
 # -----------------------------------------------------------------------------
 # Core SwiGLU math helpers
 # -----------------------------------------------------------------------------
+@torch.compile
 def _swiglu_forward_logic(preact: torch.Tensor) -> torch.Tensor:
     """h = left * silu(gate), from preact [M, 2H] -> h [M, H]."""
     left, gate = preact.chunk(2, dim=-1)
     return left * F.silu(gate)
 
 
+@torch.compile
 def _swiglu_backward_logic(preact: torch.Tensor, grad_h: torch.Tensor) -> torch.Tensor:
     """grad_preact [M, 2H] from preact and grad_h [M, H], via the explicit SiLU derivative.
 
@@ -48,7 +50,10 @@ def _swiglu_backward_logic(preact: torch.Tensor, grad_h: torch.Tensor) -> torch.
 
 
 # -----------------------------------------------------------------------------
-# Custom autograd.Function: recompute `h` in backward instead of saving it
+# Custom autograd.Function: recompute `h` in backward instead of saving it.
+# The elementwise helpers above are @torch.compile'd, so Inductor fuses their
+# pointwise chains into single kernels -- the per-op [M, H] temporaries are
+# never materialized, which is what blew up peak memory in the pure-eager path.
 # -----------------------------------------------------------------------------
 class SwiGLUMemoryOptimizedFunction(torch.autograd.Function):
     @staticmethod
