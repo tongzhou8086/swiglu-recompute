@@ -110,6 +110,36 @@ So the recompute idea **is** a memory win — at *model* scale, where the
 saved-activation pool is the bottleneck. A one-block micro-benchmark structurally
 cannot show it.
 
+## Empirical confirmation: stacking N blocks
+
+`bench_stacked_blocks.py` stacks `N` SwiGLU MLP blocks (each `dim -> hidden ->
+dim`), runs one forward then one backward, and measures peak alloc for the
+standard-autograd stack vs the recompute stack (H800, torch 2.10, bf16,
+M=11136 D=3584 H=14336):
+
+```
+  N |   ground_truth |    recompute |       saving |  saving/N
+  1 |      2002 MiB  |    2275 MiB  |    -273 MiB  |  -273 MiB   <- recompute worse (single block)
+  2 |      3297 MiB  |    2961 MiB  |    +336 MiB  |  +168 MiB   <- crossover
+  4 |      5887 MiB  |    4334 MiB  |   +1554 MiB  |  +389 MiB
+  8 |     11068 MiB  |    7078 MiB  |   +3990 MiB  |  +499 MiB   <- 36% less
+ 16 |     21429 MiB  |   12567 MiB  |   +8862 MiB  |  +554 MiB   <- 41% less
+```
+
+- At `N = 1` recompute *loses* (−273 MiB): the single-block peak is dominated by
+  the backward transient, not saved activations.
+- It crosses over at `N = 2` and the win grows ~linearly with depth — 41% less
+  peak at 16 blocks, and the fraction keeps rising.
+- Per-block growth: ~**1295 MiB/block** (ground-truth) vs ~**686 MiB/block**
+  (recompute) → **~610 MiB/block ≈ two `[M, H]` tensors**. Standard autograd
+  saves *both* `silu(gate)` (a `mul` operand) and `h` (for the `W2` matmul);
+  recompute reconstructs both from `preact`, avoiding 2×305 MiB per layer. That
+  is why `saving/N` heads toward ~610, not 305.
+
+This is the staircase argument made concrete: the win is invisible at one block
+and emerges only once the persistent saved-activation pool (which scales with
+depth) dominates the peak.
+
 ## One precision
 
 "The backward doesn't matter *at all*" is ~99% true but not literal: the peak does

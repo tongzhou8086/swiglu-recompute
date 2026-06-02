@@ -69,3 +69,25 @@ kernel writing `grad_preact` in place with no intermediate buffers).
 For *why* forward-saved activations (not the backward) set the training-memory
 peak — and why this single-block benchmark is misleading — see
 [`training_memory_forward_vs_backward.md`](./training_memory_forward_vs_backward.md).
+
+## Stacked-depth result (the real win)
+
+`bench_stacked_blocks.py` stacks `N` blocks (forward through all, then one
+backward) and measures peak memory. The recompute win is invisible at one block
+but grows ~linearly with depth:
+
+| N | ground_truth | recompute | saving |
+|---|---|---|---|
+| 1 | 2002 MiB | 2275 MiB | −273 MiB (worse) |
+| 2 | 3297 MiB | 2961 MiB | +336 MiB |
+| 4 | 5887 MiB | 4334 MiB | +1554 MiB |
+| 8 | 11068 MiB | 7078 MiB | +3990 MiB (−36%) |
+| 16 | 21429 MiB | 12567 MiB | +8862 MiB (−41%) |
+
+```bash
+python bench_stacked_blocks.py            # default N = 1,2,4,8,16
+```
+
+Per-block growth is ~1295 MiB (ground-truth) vs ~686 MiB (recompute): recompute
+avoids ~610 MiB/block ≈ *two* `[M,H]` tensors per layer (standard autograd saves
+both `silu(gate)` and `h`; recompute reconstructs both from `preact`).
