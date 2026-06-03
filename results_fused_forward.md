@@ -92,6 +92,32 @@ True  1-16| ws-fail        -        -
   (1.979 ms): the single wide dot is what makes WS legal, and WS is what closes
   the gap to cuBLAS.
 
+## Integrated packed variant in this project (`fused_forward_packed.py`)
+
+`fused_forward_packed.py` brings the packed kernel into the recompute scheme: the
+forward emits `(h, preact_packed)` from one warp-specialized launch (storing raw
+packed `preact`, not factors), and the backward recomputes `h` and `grad_preact`
+from the packed `preact` (reusing the packed `grad_de`-from-preact kernel + packed
+GEMMs). Full-MLP 4-way comparison, one fwd+bwd (`bench_fused_forward.py`):
+
+| variant | peak | fwd ms | full ms | vs recompute (fwd / full) |
+|---|---|---|---|---|
+| ground_truth (cuBLAS + eager) | 2002 MiB | 2.964 | 9.350 | — |
+| recompute (cuBLAS + `@compile`) | 2275 MiB | 2.625 | 8.478 | 1.00× / 1.00× |
+| fused-std (standard layout) | 2275 MiB | 3.045 | 8.819 | 0.86× / 0.96× |
+| **fused-packed (WS)** | 2275 MiB | **2.597** | **8.454** | **1.01× / 1.00×** |
+
+Correctness passes for both fused variants (fp32 ≤ 7.8e-6, bf16 ≤ 6.9e-3; packed
+grad compared after unpacking).
+
+- **The packed variant reaches parity / a slight edge** over the cuBLAS+compiled
+  recompute path (1.011× fwd, 1.003× full) — and it is **memory-neutral**.
+- This is the clean flip from the standard-layout variant (0.86× fwd): same
+  fusion, same recompute backward, only the **layout + warp specialization**
+  differ. The forward-only edge (~1.06× on W1-proj+activation, see above) dilutes
+  to ~1.01× across the full MLP because the shared W2 GEMM and the (identical)
+  backward dominate the rest.
+
 ## Takeaway (corrected)
 
 The fusion idea (skip the `preact` re-read / absorb the activation in the
@@ -99,6 +125,9 @@ epilogue) **is** a real forward win — but **only with the packed layout +
 warp specialization**, which lets the GEMM match cuBLAS while folding in the
 activation. The **standard layout cannot get there**: its two-dot body can't
 warp-specialize, so its GEMM trails cuBLAS by more than the fusion saves, and the
-cuBLAS-GEMM + `@torch.compile`-pointwise path beats it. So the layout choice was
-the deciding factor, not the fusion idea itself. (Memory is unchanged either way;
-this is purely a forward speed/bandwidth story.)
+cuBLAS-GEMM + `@torch.compile`-pointwise path beats it. The packed variant
+(`fused_forward_packed.py`) closes the gap — parity-to-slightly-faster on the full
+MLP, memory-neutral. So the layout choice was the deciding factor, not the fusion
+idea itself. (Memory is unchanged across all variants; this is purely a forward
+speed/bandwidth story — the recompute memory win still comes from depth, per the
+main README.)
