@@ -45,7 +45,8 @@ depth on B200 (up to 1.17× at N=16), a touch higher than H800's flat ~1.08×.
 |---|---|---|---|---|
 | 1 | 2002 MiB / 9.0 ms | 1699 / 7.8 | 2275 / 8.2 | +34% mem, 0.95× speed |
 | 4 | 5888 / 37.3 | 4670 / 32.7 | 4334 / 33.1 | −7% mem, 0.99× speed |
-| 8 | 11068 / 63.7 | 8633 / 55.5 | 7078 / 56.0 | **−18% mem**, 0.99× speed |
+| 8 | 11068 / 63.7 | 8633 / 55.5 | 7078 / 56.0 | −18% mem, 0.99× speed |
+| 16 | 21429 / 120.8 | 16558 / 102.7 | 12567 / 104.3 | **−24% mem**, 0.99× speed |
 
 Same qualitative story as H800:
 
@@ -53,8 +54,9 @@ Same qualitative story as H800:
   (slightly slower), the earlier "faster" was compiled-vs-eager.
 - **`torch.compile` alone** already cuts memory for free (Inductor auto-recomputes
   ~one `[M,H]`/block).
-- **Manual recompute's value is extra memory at depth** (−18% at N=8 vs
-  gt-compiled, growing), at a ~1% speed cost — not a free speedup.
+- **Manual recompute's value is extra memory at depth** — the reduction vs
+  gt-compiled grows monotonically with depth (−7% at N=4, −18% at N=8, −24% at
+  N=16), at a ~1% speed cost — not a free speedup.
 
 ## H800 → B200 summary
 
