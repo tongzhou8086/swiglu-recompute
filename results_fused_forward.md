@@ -134,16 +134,74 @@ grad compared after unpacking).
   That is the *single-block* regime; the recompute memory win only appears across
   stacked depth (see the main README's stacked + fair-compile tables).
 
+## Stacked depth: the memory crossover (`bench_fused_stacked.py`)
+
+One block is misleading on memory (the +34% above). Stacking `N` blocks (forward
+through all, one backward) shows the real picture. The three save-`preact`
+variants (recompute, fused-std, fused-packed) have **identical** peak memory —
+memory is a property of the recompute *scheme*, not the kernel — so they share one
+column:
+
+**Peak memory (MiB):**
+
+| N | gt-eager | gt-compiled | save-preact (rc / fused-std / fused-packed) |
+|---|---|---|---|
+| 1 | 2002 | 1699 | 2275 |
+| 2 | 3297 | 2689 | 2961 |
+| 4 | 5888 | 4670 | 4334 |
+| 8 | 11068 | 8633 | 7078 |
+| 16 | 21429 | 16558 | **12567** |
+
+**Full fwd+bwd (ms):**
+
+| N | gt-eager | gt-compiled | recompute | fused-std | fused-packed |
+|---|---|---|---|---|---|
+| 1 | 8.8 | 8.0 | 8.1 | 8.5 | 8.0 |
+| 4 | 37.3 | 32.8 | 32.9 | 35.2 | 33.1 |
+| 8 | 63.2 | 54.7 | 55.5 | 59.8 | 57.6 |
+| 16 | 120.0 | 102.2 | 103.8 | 112.4 | 108.8 |
+
+**fused-packed vs the two baselines:**
+
+| N | mem vs eager | mem vs compiled | time vs eager | time vs compiled |
+|---|---|---|---|---|
+| 1 | −14% | −34% | 1.107× | 0.995× |
+| 4 | +26% | +7% | 1.125× | 0.989× |
+| 8 | +36% | +18% | 1.097× | 0.950× |
+| 16 | **+41%** | **+24%** | 1.103× | 0.939× |
+
+- **Memory crossover:** the save-`preact` variants lose at N=1 but win with depth —
+  by N=16 they use **41% less than eager and 24% less than the fair compiled
+  baseline**. The single-block "+34%" was the misleading regime; in a real
+  (deep) model the recompute scheme is a substantial memory win.
+- **Time:** fused-packed stays ~1.1× faster than eager at all depths and ~parity
+  with gt-compiled at small N, drifting to 0.94× by N=16. At depth `recompute`
+  (cuBLAS + compiled pointwise) is actually the time-competitive save-`preact`
+  variant (103.8 vs 108.8 ms at N=16): fused-packed's forward edge is small
+  per block, while its backward (packed `grad_de` kernel + gather `h`-recompute)
+  costs a bit more than the compiled-pointwise backward, and that accumulates.
+
 ## Takeaway (corrected)
 
-The fusion idea (skip the `preact` re-read / absorb the activation in the
-epilogue) **is** a real forward win — but **only with the packed layout +
-warp specialization**, which lets the GEMM match cuBLAS while folding in the
-activation. The **standard layout cannot get there**: its two-dot body can't
-warp-specialize, so its GEMM trails cuBLAS by more than the fusion saves, and the
-cuBLAS-GEMM + `@torch.compile`-pointwise path beats it. The packed variant
-(`fused_forward_packed.py`) closes the gap — parity-to-slightly-faster on the full
-MLP, memory-neutral. So the layout choice was the deciding factor, not the fusion
-idea itself. (Memory is unchanged across all variants; this is purely a forward
-speed/bandwidth story — the recompute memory win still comes from depth, per the
-main README.)
+**On the forward kernel:** the fusion idea (skip the `preact` re-read / absorb the
+activation in the epilogue) **is** a real forward win — but **only with the packed
+layout + warp specialization**, which lets the GEMM match cuBLAS while folding in
+the activation. The **standard layout cannot get there**: its two-dot body can't
+warp-specialize, so its GEMM trails cuBLAS by more than the fusion saves. The
+packed variant closes the gap — ~parity with the compiled baseline on the full
+MLP, ~1.1× over eager. So the layout choice was the deciding factor, not the
+fusion idea itself.
+
+**On memory (the headline for the project):** all three save-`preact` variants are
+memory-identical and the recompute scheme is a real win **at depth** — by N=16 it
+uses **41% less than eager and 24% less than the fair `torch.compile`d baseline**.
+The single-block "+34%" comparison is misleading; a real (deep) model is where the
+recompute scheme pays off. The fused kernel changes *speed*, not this memory
+curve.
+
+**Net:** if you want the memory savings, the cheapest correct route at depth is
+`recompute` (cuBLAS + `@torch.compile` pointwise) — same memory as the fused
+variants and the best time among them at depth. The packed fused kernel is the
+interesting forward-throughput artifact (matches cuBLAS+activation), but on this
+end-to-end MLP its small forward edge doesn't beat the compiled baseline once the
+backward is included.
