@@ -55,7 +55,7 @@ from swiglu_recompute import _swiglu_forward_logic, _swiglu_backward_logic
 BLOCK_SIZE_M = 128
 BLOCK_SIZE_N_HALF = 128   # block over the hidden dim H (= N_HALF)
 BLOCK_SIZE_K = 64
-GROUP_SIZE_M = 8
+GROUP_SIZE_M = 16   # tuned: 16 > 8 > 4 > 1 on B200 at the project shape
 NUM_WARPS = 8
 NUM_STAGES = 4
 # Triton 3.7's automatic warp-specialization pass can't partition the two-dot /
@@ -188,10 +188,17 @@ def _fused_matmul_swiglu_save_preact_kernel(
 def fused_matmul_swiglu_save_preact(
     x: torch.Tensor,
     wt: torch.Tensor,
+    *,
+    group_size_m: int = GROUP_SIZE_M,
+    warp_specialize: bool = WARP_SPECIALIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One launch: returns (preact [M, 2H], h [M, H]) for ``preact = x @ wt``.
 
     ``x`` is [M, K]; ``wt`` is [K, 2H] standard layout (left = wt[:, :H]).
+
+    ``group_size_m`` is the L2-swizzle group size (16 tuned best on B200 at the
+    project shape). ``warp_specialize`` is exposed for experiments but does not
+    compile for this two-dot body in triton 3.7 (left False).
     """
     _ensure_allocator()
     assert x.is_cuda and wt.is_cuda
@@ -239,8 +246,8 @@ def fused_matmul_swiglu_save_preact(
         BLOCK_SIZE_M_=BLOCK_SIZE_M,
         BLOCK_SIZE_N_HALF_=BLOCK_SIZE_N_HALF,
         BLOCK_SIZE_K_=block_k,
-        GROUP_SIZE_M_=GROUP_SIZE_M,
-        WARP_SPECIALIZE_=WARP_SPECIALIZE,
+        GROUP_SIZE_M_=group_size_m,
+        WARP_SPECIALIZE_=warp_specialize,
         FLATTEN_=FLATTEN,
         INPUT_PRECISION=input_precision,
         num_warps=NUM_WARPS,
