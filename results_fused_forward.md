@@ -98,25 +98,41 @@ True  1-16| ws-fail        -        -
 forward emits `(h, preact_packed)` from one warp-specialized launch (storing raw
 packed `preact`, not factors), and the backward recomputes `h` and `grad_preact`
 from the packed `preact` (reusing the packed `grad_de`-from-preact kernel + packed
-GEMMs). Full-MLP 4-way comparison, one fwd+bwd (`bench_fused_forward.py`):
+GEMMs). Full-MLP comparison, one fwd+bwd (`bench_fused_forward.py`), against
+**two baselines** (per `bench_fair_compile.py`): eager ground-truth and
+`torch.compile`'d ground-truth (AOTAutograd + Inductor, which auto-recomputes):
 
-| variant | peak | fwd ms | full ms | vs recompute (fwd / full) |
+| variant | peak | fwd ms | full ms |
+|---|---|---|---|
+| gt-eager | 2002 MiB | 2.998 | 9.329 |
+| gt-compiled (fair baseline) | 1699 MiB | 2.575 | 8.339 |
+| recompute (cuBLAS + `@compile` pointwise) | 2275 MiB | 2.611 | 8.470 |
+| fused-std (standard layout) | 2275 MiB | 3.037 | 8.851 |
+| **fused-packed (WS)** | 2275 MiB | **2.647** | **8.396** |
+
+Speedup (>1 = faster):
+
+| variant | fwd / eager | fwd / compiled | full / eager | full / compiled |
 |---|---|---|---|---|
-| ground_truth (cuBLAS + eager) | 2002 MiB | 2.964 | 9.350 | — |
-| recompute (cuBLAS + `@compile`) | 2275 MiB | 2.625 | 8.478 | 1.00× / 1.00× |
-| fused-std (standard layout) | 2275 MiB | 3.045 | 8.819 | 0.86× / 0.96× |
-| **fused-packed (WS)** | 2275 MiB | **2.597** | **8.454** | **1.01× / 1.00×** |
+| recompute | 1.148× | 0.986× | 1.101× | 0.985× |
+| fused-std | 0.987× | 0.848× | 1.054× | 0.942× |
+| **fused-packed** | **1.133×** | **0.973×** | **1.111×** | **0.993×** |
 
 Correctness passes for both fused variants (fp32 ≤ 7.8e-6, bf16 ≤ 6.9e-3; packed
 grad compared after unpacking).
 
-- **The packed variant reaches parity / a slight edge** over the cuBLAS+compiled
-  recompute path (1.011× fwd, 1.003× full) — and it is **memory-neutral**.
-- This is the clean flip from the standard-layout variant (0.86× fwd): same
-  fusion, same recompute backward, only the **layout + warp specialization**
-  differ. The forward-only edge (~1.06× on W1-proj+activation, see above) dilutes
-  to ~1.01× across the full MLP because the shared W2 GEMM and the (identical)
-  backward dominate the rest.
+- **vs eager ground truth:** fused-packed is a clear win — **1.13× fwd, 1.11× full**.
+- **vs the fair `torch.compile`d baseline:** fused-packed is **0.97× fwd / 0.99×
+  full — essentially parity** (within noise). The standard-layout variant loses to
+  both (0.85× fwd / 0.94× full vs compiled).
+- This is the clean flip from the standard-layout variant: same fusion, same
+  recompute backward, only the **layout + warp specialization** differ. The
+  forward-only edge (~1.06× on W1-proj+activation, see above) dilutes across the
+  full MLP because the shared W2 GEMM and the (identical) backward dominate.
+- **Memory (one block):** `gt-compiled` is lowest (1699 MiB) — Inductor
+  auto-recomputes ~one `[M,H]`/block; the recompute/fused variants are +34% here.
+  That is the *single-block* regime; the recompute memory win only appears across
+  stacked depth (see the main README's stacked + fair-compile tables).
 
 ## Takeaway (corrected)
 

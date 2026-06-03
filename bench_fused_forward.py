@@ -162,10 +162,13 @@ def run_bench(M, D, H, Dout, dtype):
     torch.manual_seed(0)
     x0 = torch.randn(M, D, device="cuda", dtype=dtype)
     gt, rc, fu, pk = make_quad(D, H, Dout, dtype)
+    gtc = torch.compile(gt)   # fair baseline: AOTAutograd + Inductor (auto-recompute)
     gout = torch.randn(M, Dout, device="cuda", dtype=dtype)
 
+    # Two baselines (per bench_fair_compile.py): eager GT and torch.compile'd GT.
     variants = [
-        ("ground_truth", gt, [gt.w1, gt.w2]),
+        ("gt-eager", gt, [gt.w1, gt.w2]),
+        ("gt-compiled", gtc, [gt.w1, gt.w2]),
         ("recompute", rc, [rc.w1, rc.w2]),
         ("fused-std", fu, [fu.w1t, fu.w2]),
         ("fused-packed", pk, [pk.packed_weight, pk.w2]),
@@ -185,12 +188,22 @@ def run_bench(M, D, H, Dout, dtype):
         times[name] = (f, full)
         print(f"      {name:<14s} {f:>9.3f} {full:>9.3f}")
 
-    rf, rfull = times["recompute"]
-    print("\n  vs recompute (cuBLAS GEMM + @compile pointwise):")
-    for name in ("fused-std", "fused-packed"):
+    ef, efull = times["gt-eager"]
+    cf, cfull = times["gt-compiled"]
+    print("\n  speedup vs baselines (>1 = faster):")
+    print(f"      {'variant':<14s} {'fwd/eager':>10} {'fwd/comp':>10} "
+          f"{'full/eager':>11} {'full/comp':>10}")
+    for name in ("recompute", "fused-std", "fused-packed"):
         f, full = times[name]
-        print(f"      {name:<14s}: fwd {rf / f:.3f}x   full {rfull / full:.3f}x")
-    print("  (all fused variants are memory-neutral vs recompute; the win is forward bandwidth)")
+        print(f"      {name:<14s} {ef / f:>9.3f}x {cf / f:>9.3f}x "
+              f"{efull / full:>10.3f}x {cfull / full:>9.3f}x")
+    print("\n  peak vs gt-compiled:")
+    for name in ("recompute", "fused-std", "fused-packed"):
+        d = mems[name] - mems["gt-compiled"]
+        print(f"      {name:<14s}: {d:+8.1f} MiB "
+              f"({100 * d / mems['gt-compiled']:+.1f}%)")
+    print("  (fused variants are memory-neutral vs recompute; gt-compiled auto-recomputes,"
+          " so it sits below at one block)")
 
 
 def main():
