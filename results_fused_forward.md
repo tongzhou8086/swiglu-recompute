@@ -56,33 +56,49 @@ True  1-16| ws-fail        -        -
 
 - **`GROUP_SIZE_M=16` is best** (1.979 ms; vs 1.983 at 8, 2.057 at 4, 2.475 at 1) —
   a real but small L2-swizzle win. Now the default.
-- **Warp specialization cannot be enabled.** `warp_specialize=True` fails to
-  compile for the standard-layout **two-dot** body (`TritonGPUAutomaticWarpSpecialization`
-  MLIR error). A single-wide-dot variant (build the `[BK,2·BN]` tile with
-  `tl.cat`) — which *would* be WS-partitionable — also fails: `tl.cat`
-  concatenates along axis 0, so it can't form the wide column tile without the
-  pre-packed weight layout. So on the standard layout, WS is unavailable in
-  triton 3.7.
-- **WS wouldn't close the gap anyway.** cuBLAS GEMM-only is 1.556 ms at ~73% of
-  B200 BF16 peak, so a Triton kernel at `fused_swiglu`'s WS-tuned ~58% of peak
-  would take ≈ 1.556 × (73/58) ≈ **1.96 ms** — essentially what our *non-WS*
-  two-dot kernel at `G=16` already hits (1.98 ms). We're already at the
-  throughput a warp-specialized Triton kernel reaches at this shape; cuBLAS is
-  simply faster than Triton for this GEMM. Even the best fused config is slower
-  than cuBLAS **GEMM-alone** (1.98 vs 1.56 ms) — before counting the activation.
+- **Warp specialization cannot be enabled *on the standard layout*.**
+  `warp_specialize=True` fails to compile for the **two-dot** body
+  (`TritonGPUAutomaticWarpSpecialization` MLIR error). A single-wide-dot variant
+  built with `tl.cat` — which *would* be WS-partitionable — also fails: `tl.cat`
+  concatenates along axis 0, so it can't form the `[BK,2·BN]` wide tile without
+  the pre-packed weight layout. So WS is unavailable here in triton 3.7.
 
-## Takeaway
+## The packed layout *does* win — verified (`bench_packed_vs_cublas.py`)
 
-The fusion is correct, clean, and memory-neutral, and the *idea* (skip the
-`preact` re-read) is sound — but on B200 at this shape the bottleneck is GEMM
-throughput, and a hand-written Triton GEMM does not beat cuBLAS here. Warp
-specialization is not the missing lever (we already match its achievable
-throughput, and it can't be enabled on the standard layout anyway). The
-cuBLAS-GEMM + `@torch.compile`-pointwise path (the existing `recompute` variant)
-remains the fastest forward.
+> [!IMPORTANT]
+> An earlier version of this note claimed WS "wouldn't close the gap anyway"
+> (citing cuBLAS ~73% / Triton ~58% of peak). **That was wrong.** Measured
+> directly on B200, the packed warp-specialized kernel from `fused_swiglu`
+> (`fused_swiglu_wide_packed`: one wide dot, `WARP_SPECIALIZE=True`,
+> `GROUP_SIZE_M=32`) **beats cuBLAS + a separate activation** at this shape:
 
-(The packed single-wide-dot layout — `fused_swiglu`'s approach — was not
-implemented; this experiment deliberately stayed in the standard layout. Given
-`fused_swiglu`'s own ~58%-vs-73% result, it would likely also trail cuBLAS at
-this shape, with its real payoff being the *factor side-store* that cheapens the
-backward, not the forward.)
+| variant (W1-proj + activation only) | ms | TFLOP/s | % of ~2250 peak |
+|---|---|---|---|
+| cuBLAS GEMM only (floor) | 1.587 | 1442 | ~64% |
+| cuBLAS GEMM + `@compile` act (standard, fairest) | 1.785 | 1282 | — |
+| cuBLAS GEMM + `@compile` act (packed/gather) | 1.790 | 1279 | — |
+| **packed fused (WS, one wide dot)** | **1.677** | 1364 | ~61% |
+
+- **packed-fused is 1.064× faster than cuBLAS + a separate activation** (vs the
+  *fairest* standard-weight baseline; the packed/gather baseline is the same
+  1.067×), and only 5.4% slower than the raw cuBLAS GEMM — the activation is
+  absorbed almost for free in the epilogue. (The standard vs packed activation
+  baselines are within noise, 1.785 vs 1.790 — the gather isn't the cost; the
+  separate-kernel launch + `preact` round-trip is.)
+- cuBLAS (~63% peak) and the packed-WS Triton GEMM (~61%) are **nearly equal** on
+  raw throughput; the 58/73 figures cited before did not apply to this kernel.
+  Fusing the activation more than covers the tiny GEMM gap.
+- The packed kernel (1.667 ms) is **1.19× faster than our standard-layout best**
+  (1.979 ms): the single wide dot is what makes WS legal, and WS is what closes
+  the gap to cuBLAS.
+
+## Takeaway (corrected)
+
+The fusion idea (skip the `preact` re-read / absorb the activation in the
+epilogue) **is** a real forward win — but **only with the packed layout +
+warp specialization**, which lets the GEMM match cuBLAS while folding in the
+activation. The **standard layout cannot get there**: its two-dot body can't
+warp-specialize, so its GEMM trails cuBLAS by more than the fusion saves, and the
+cuBLAS-GEMM + `@torch.compile`-pointwise path beats it. So the layout choice was
+the deciding factor, not the fusion idea itself. (Memory is unchanged either way;
+this is purely a forward speed/bandwidth story.)
