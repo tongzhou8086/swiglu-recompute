@@ -77,7 +77,7 @@ def measure_peak(model, x0, gout, reps=3):
     return mib(best)
 
 
-def time_full(model, x0, gout, iters=8, warmup=4, reps=3):
+def time_full(model, x0, gout, iters=8, warmup=4, reps=10):
     """Full fwd+bwd time per step (ms), min over reps."""
     params = list(model.parameters())
 
