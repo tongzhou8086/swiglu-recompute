@@ -32,6 +32,7 @@ sys.path.insert(0, str(THIS_DIR))
 from swiglu_recompute import SwiGLUMLPCustom, SwiGLUMLPGroundTruth  # noqa: E402
 from fused_forward import SwiGLUMLPFused  # noqa: E402
 from fused_forward_packed import SwiGLUMLPPackedFused, pack_swiglu_linear_weight  # noqa: E402
+from fused_forward_packed_canon import SwiGLUMLPPackedFusedCanon  # noqa: E402
 
 MIB = 1024 * 1024
 
@@ -52,43 +53,51 @@ def rel_max(a, b):
 
 
 def make_quad(D, H, Dout, dtype):
-    """Ground-truth, recompute, standard-fused, packed-fused -- identical weights."""
+    """Ground-truth, recompute, std-fused, packed-fused, packed-fused-canon."""
     gt = SwiGLUMLPGroundTruth(D, H, Dout, dtype=dtype).cuda()
     rc = SwiGLUMLPCustom(D, H, Dout, dtype=dtype).cuda()
     fu = SwiGLUMLPFused(D, H, Dout, dtype=dtype).cuda()
     pk = SwiGLUMLPPackedFused(D, H, Dout, dtype=dtype).cuda()
+    pc = SwiGLUMLPPackedFusedCanon(D, H, Dout, dtype=dtype).cuda()
     with torch.no_grad():
         rc.w1.copy_(gt.w1)
         rc.w2.copy_(gt.w2)
         fu.w1t.copy_(gt.w1.t().contiguous())   # Wt = W1.t()
         fu.w2.copy_(gt.w2)
-        pk.packed_weight.copy_(pack_swiglu_linear_weight(gt.w1.contiguous()))
+        packed = pack_swiglu_linear_weight(gt.w1.contiguous())
+        pk.packed_weight.copy_(packed)
         pk.w2.copy_(gt.w2)
-    return gt, rc, fu, pk
+        pc.packed_weight.copy_(packed)
+        pc.w2.copy_(gt.w2)
+    return gt, rc, fu, pk, pc
 
 
 def run_correctness(D, H, Dout, dtype, tol):
     from fused_forward_packed import unpack_swiglu_linear_weight
     torch.manual_seed(42)
     M = 512
-    gt, rc, fu, pk = make_quad(D, H, Dout, dtype)
+    gt, rc, fu, pk, pc = make_quad(D, H, Dout, dtype)
     x0 = torch.randn(M, D, device="cuda", dtype=dtype)
 
     xg = x0.detach().clone().requires_grad_(True)
     xf = x0.detach().clone().requires_grad_(True)
     xp = x0.detach().clone().requires_grad_(True)
+    xc = x0.detach().clone().requires_grad_(True)
     yg = gt(xg)
     yf = fu(xf)
     yp = pk(xp)
+    yc = pc(xc)
     gout = torch.randn_like(yg)
     gg = torch.autograd.grad(yg, [xg, gt.w1, gt.w2], gout)
     gf = torch.autograd.grad(yf, [xf, fu.w1t, fu.w2], gout)
     gp = torch.autograd.grad(yp, [xp, pk.packed_weight, pk.w2], gout)
+    gc_ = torch.autograd.grad(yc, [xc, pc.packed_weight, pc.w2], gout)
 
     ok = True
     for label, y, g, gW1 in (
-        ("fused (standard)", yf, gf, gf[1].t()),                       # grad wrt Wt
-        ("packed", yp, gp, unpack_swiglu_linear_weight(gp[1])),        # packed grad -> [2H,D]
+        ("fused (standard)", yf, gf, gf[1].t()),                          # grad wrt Wt
+        ("packed", yp, gp, unpack_swiglu_linear_weight(gp[1])),           # packed grad -> [2H,D]
+        ("packed-canon", yc, gc_, unpack_swiglu_linear_weight(gc_[1])),   # canonical form
     ):
         print(f"  [correctness {dtype}]  {label} vs ground_truth  (tol={tol})")
         checks = {"out": rel_max(y, yg), "grad_x": rel_max(g[0], gg[0]),
@@ -98,7 +107,7 @@ def run_correctness(D, H, Dout, dtype, tol):
             ok = ok and passed
             print(f"      {name:<9s} rel_max={r:.3e}  {'OK' if passed else 'FAIL'}")
     print(f"  => {'PASS' if ok else 'FAIL'}")
-    del gt, rc, fu, pk, xg, xf, xp, yg, yf, yp, gg, gf, gp, x0
+    del gt, rc, fu, pk, pc, xg, xf, xp, xc, yg, yf, yp, yc, gg, gf, gp, gc_, x0
     sync_clean()
     return ok
 
@@ -161,7 +170,7 @@ def run_bench(M, D, H, Dout, dtype):
           f"h [M,H] = {mib(M * H * dtype.itemsize):.1f} MiB")
     torch.manual_seed(0)
     x0 = torch.randn(M, D, device="cuda", dtype=dtype)
-    gt, rc, fu, pk = make_quad(D, H, Dout, dtype)
+    gt, rc, fu, pk, pc = make_quad(D, H, Dout, dtype)
     gtc = torch.compile(gt)   # fair baseline: AOTAutograd + Inductor (auto-recompute)
     gout = torch.randn(M, Dout, device="cuda", dtype=dtype)
 
@@ -172,6 +181,7 @@ def run_bench(M, D, H, Dout, dtype):
         ("recompute", rc, [rc.w1, rc.w2]),
         ("fused-std", fu, [fu.w1t, fu.w2]),
         ("fused-packed", pk, [pk.packed_weight, pk.w2]),
+        ("fused-canon", pc, [pc.packed_weight, pc.w2]),
     ]
 
     print("\n  [peak memory: one fwd+bwd]")
@@ -193,12 +203,12 @@ def run_bench(M, D, H, Dout, dtype):
     print("\n  speedup vs baselines (>1 = faster):")
     print(f"      {'variant':<14s} {'fwd/eager':>10} {'fwd/comp':>10} "
           f"{'full/eager':>11} {'full/comp':>10}")
-    for name in ("recompute", "fused-std", "fused-packed"):
+    for name in ("recompute", "fused-std", "fused-packed", "fused-canon"):
         f, full = times[name]
         print(f"      {name:<14s} {ef / f:>9.3f}x {cf / f:>9.3f}x "
               f"{efull / full:>10.3f}x {cfull / full:>9.3f}x")
     print("\n  peak vs gt-compiled:")
-    for name in ("recompute", "fused-std", "fused-packed"):
+    for name in ("recompute", "fused-std", "fused-packed", "fused-canon"):
         d = mems[name] - mems["gt-compiled"]
         print(f"      {name:<14s}: {d:+8.1f} MiB "
               f"({100 * d / mems['gt-compiled']:+.1f}%)")
